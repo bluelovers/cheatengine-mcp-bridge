@@ -3521,6 +3521,11 @@ function cmd_create_group(params)
         return { success = false, error = "description required", error_code = "INVALID_PARAMS" }
     end
 
+    -- CE's own group headers default to manual expand/collapse, so passers-by
+    -- get the same behaviour without having to ask for it.
+    local options = unit18_normalize_options(
+        params.options ~= nil and params.options or "moManualExpandCollapse")
+
     local al, aerr = unit18_get_al()
     if not al then return aerr end
 
@@ -3546,6 +3551,9 @@ function cmd_create_group(params)
     end
     if not pcall(function() rec.Description = description end) then
         return rollback({ success = false, error = "Failed to set Description", error_code = "INTERNAL_ERROR" })
+    end
+    if not pcall(function() rec.Options = options end) then
+        return rollback({ success = false, error = "Failed to set Options", error_code = "INTERNAL_ERROR" })
     end
     if parent and not pcall(function() rec:appendToEntry(parent) end) then
         return rollback({ success = false, error = "Failed to append to parent", error_code = "INTERNAL_ERROR" })

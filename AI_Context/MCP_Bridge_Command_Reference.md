@@ -2710,11 +2710,12 @@ All fields are validated before anything is written, so a bad parameter leaves t
 **Parameters:**
 - `description` (str, required): Group label.
 - `parent_id` (int, optional): Existing record ID to nest under; omit for a top-level group.
+- `options` (str, optional): Override the record options. Defaults to `moManualExpandCollapse`, matching group headers CE creates itself.
 
 **Returns:** JSON with:
 - `success` (bool)
 - `id` (int): New group header ID.
-- `record` (object): `{id, description, is_group_header=true, ...}`
+- `record` (object): `{id, description, options="[moManualExpandCollapse]", is_group_header=true, ...}`
 
 **Error codes:** `INVALID_PARAMS`, `NOT_FOUND`, `INTERNAL_ERROR`
 

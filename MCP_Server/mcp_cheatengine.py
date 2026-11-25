@@ -1639,13 +1639,18 @@ def update_memory_record(id: int, description: str = None, address: str = None,
     return format_result(ce_client.send_command("update_memory_record", params))
 
 @mcp.tool()
-def create_group(description: str, parent_id: int = None) -> str:
+def create_group(description: str, parent_id: int = None, options: str = None) -> str:
     """Create a group header entry in the cheat table address list.
+
+    Newly created groups default to Options="moManualExpandCollapse", matching
+    group headers CE itself creates.
 
     Args:
         description: Label for the group header.
         parent_id: ID of an existing record to nest this group under (optional;
             omit for a top-level group).
+        options: Override the record options, e.g. "moHideChildren" or
+            "[moManualExpandCollapse, moAllowManualCollapseAndExpand]".
 
     Returns JSON with: success, id, record ({id, description, address, type,
     value, offsets, enabled, options, color, collapsed, is_group_header}).
@@ -1653,6 +1658,8 @@ def create_group(description: str, parent_id: int = None) -> str:
     params = {"description": description}
     if parent_id is not None:
         params["parent_id"] = parent_id
+    if options is not None:
+        params["options"] = options
     return format_result(ce_client.send_command("create_group", params))
 
 @mcp.tool()
