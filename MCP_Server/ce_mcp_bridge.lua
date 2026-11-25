@@ -3120,6 +3120,8 @@ local UNIT18_TYPE_MAP = {
     string    = "vtString",
     bytearray = "vtByteArray",
     aob       = "vtByteArray",
+    aa        = "vtAutoAssembler",
+    autoassemble = "vtAutoAssembler",
 }
 
 -- Returns (al, nil) on success or (nil, error-response-table) on failure.
@@ -3166,13 +3168,17 @@ local function unit18_rec_to_table(rec)
     end
 
     return {
-        id          = prop("ID"),
-        description = prop("Description") or "",
-        address     = prop("Address")     or "",
-        type        = prop("VarType")     or "",
-        value       = prop("Value")       or "",
-        offsets     = offsets,
-        enabled     = prop("Active")      or false,
+        id              = prop("ID"),
+        description     = prop("Description") or "",
+        address         = prop("Address")     or "",
+        type            = prop("VarType")     or "",
+        value           = prop("Value")       or "",
+        offsets         = offsets,
+        enabled         = prop("Active")      or false,
+        options         = prop("Options")     or "",
+        color           = prop("Color"),
+        collapsed       = prop("Collapsed")   or false,
+        is_group_header = prop("IsGroupHeader") or false,
     }
 end
 
@@ -3181,7 +3187,10 @@ function cmd_load_table(params)
     local err = unit18_check_filename(filename)
     if err then return err end
 
-    local ok, cerr = pcall(loadTable, filename, params.merge or false)
+    -- ignore_lua_script_dialog suppresses CE's "table contains a lua script"
+    -- prompt, which would otherwise block the pipe while waiting for a click.
+    local ok, cerr = pcall(loadTable, filename, params.merge or false,
+                           params.ignore_lua_script_dialog or false)
     if not ok then
         return { success = false, error = tostring(cerr), error_code = "INTERNAL_ERROR" }
     end
@@ -3372,6 +3381,206 @@ function cmd_set_memory_record_value(params)
     end
 
     return { success = true }
+end
+
+-- Accepts a number, or a hex string ("80FF80" / "#80FF80" / "0x80FF80").
+-- Returns nil when the value cannot be interpreted as a color.
+local function unit18_parse_color(v)
+    if type(v) == "number" then return v end
+    if type(v) == "string" then
+        local s = v:gsub("^#", "")
+        local n = tonumber(s, 16)
+        if n then return n end
+    end
+    return nil
+end
+
+-- CE stores Options as "[a,b]"; accept both bare and bracketed forms.
+local function unit18_normalize_options(v)
+    local s = tostring(v):match("^%s*(.-)%s*$")
+    if s == "" then return "[]" end
+    if s:sub(1, 1) ~= "[" then s = "[" .. s .. "]" end
+    return s
+end
+
+-- Validates every field before touching the record, so a bad parameter
+-- never leaves a partially updated entry behind.
+local function unit18_validate_update(params)
+    if params.description ~= nil and (type(params.description) ~= "string" or params.description == "") then
+        return { success = false, error = "description must be a non-empty string", error_code = "INVALID_PARAMS" }
+    end
+    if params.address ~= nil and (type(params.address) ~= "string" or params.address == "") then
+        return { success = false, error = "address must be a non-empty string", error_code = "INVALID_PARAMS" }
+    end
+    if params.options ~= nil and type(params.options) ~= "string" then
+        return { success = false, error = "options must be a string", error_code = "INVALID_PARAMS" }
+    end
+    if params.color ~= nil and unit18_parse_color(params.color) == nil then
+        return { success = false, error = "color must be an integer or a hex string like 80FF80", error_code = "INVALID_PARAMS" }
+    end
+    if params.collapsed ~= nil and type(params.collapsed) ~= "boolean" then
+        return { success = false, error = "collapsed must be a boolean", error_code = "INVALID_PARAMS" }
+    end
+    if params.script ~= nil and type(params.script) ~= "string" then
+        return { success = false, error = "script must be a string", error_code = "INVALID_PARAMS" }
+    end
+
+    if params.type ~= nil then
+        local vtName = UNIT18_TYPE_MAP[string.lower(tostring(params.type))]
+        if not vtName then
+            return { success = false, error = "Unknown type: " .. tostring(params.type), error_code = "INVALID_PARAMS" }
+        end
+        return nil, vtName
+    end
+    -- A script only has meaning on an Auto Assemble record, so switching
+    -- scripts also switches the record type unless the caller said otherwise.
+    if params.script ~= nil then return nil, "vtAutoAssembler" end
+    return nil, nil
+end
+
+function cmd_update_memory_record(params)
+    local id = params.id
+    if id == nil then
+        return { success = false, error = "id required", error_code = "INVALID_PARAMS" }
+    end
+
+    local hasField = false
+    for _, key in ipairs({ "description", "address", "type", "options", "color", "collapsed", "script" }) do
+        if params[key] ~= nil then hasField = true end
+    end
+    if not hasField then
+        return { success = false,
+                 error = "at least one of description/address/type/options/color/collapsed/script required",
+                 error_code = "INVALID_PARAMS" }
+    end
+
+    local verr, vtName = unit18_validate_update(params)
+    if verr then return verr end
+
+    local al, aerr = unit18_get_al()
+    if not al then return aerr end
+
+    local rec, rerr = unit18_get_rec_by_id(al, id)
+    if not rec then return rerr end
+
+    local function set_prop(name, val)
+        local ok = pcall(function() rec[name] = val end)
+        if not ok then
+            return { success = false, error = "Failed to set " .. name, error_code = "INTERNAL_ERROR" }
+        end
+    end
+
+    local perr
+
+    if params.description ~= nil then
+        perr = set_prop("Description", params.description)
+        if perr then return perr end
+    end
+
+    if vtName ~= nil then
+        local okT = pcall(function() rec.VarType = vtName end)
+        if not okT then okT = pcall(function() rec.VarType = _G[vtName] end) end
+        if not okT then
+            return { success = false, error = "Failed to set VarType", error_code = "INTERNAL_ERROR" }
+        end
+    end
+
+    if params.address ~= nil then
+        perr = set_prop("Address", params.address)
+        if perr then return perr end
+    end
+
+    if params.script ~= nil then
+        perr = set_prop("Script", params.script)
+        if perr then return perr end
+    end
+
+    if params.options ~= nil then
+        perr = set_prop("Options", unit18_normalize_options(params.options))
+        if perr then return perr end
+    end
+
+    if params.color ~= nil then
+        perr = set_prop("Color", unit18_parse_color(params.color))
+        if perr then return perr end
+    end
+
+    if params.collapsed ~= nil then
+        perr = set_prop("Collapsed", params.collapsed)
+        if perr then return perr end
+    end
+
+    local out = unit18_rec_to_table(rec)
+    if params.script ~= nil then out.script = params.script end
+    return { success = true, record = out }
+end
+
+function cmd_create_group(params)
+    local description = params.description
+    if type(description) ~= "string" or description == "" then
+        return { success = false, error = "description required", error_code = "INVALID_PARAMS" }
+    end
+
+    local al, aerr = unit18_get_al()
+    if not al then return aerr end
+
+    local parent
+    if params.parent_id ~= nil then
+        local perr
+        parent, perr = unit18_get_rec_by_id(al, params.parent_id)
+        if not parent then return perr end
+    end
+
+    local okC, rec = pcall(function() return al:createMemoryRecord() end)
+    if not okC or not rec then
+        return { success = false, error = tostring(rec), error_code = "INTERNAL_ERROR" }
+    end
+
+    local function rollback(err)
+        pcall(function() rec:delete() end)
+        return err
+    end
+
+    if not pcall(function() rec.IsGroupHeader = true end) then
+        return rollback({ success = false, error = "Failed to set IsGroupHeader", error_code = "INTERNAL_ERROR" })
+    end
+    if not pcall(function() rec.Description = description end) then
+        return rollback({ success = false, error = "Failed to set Description", error_code = "INTERNAL_ERROR" })
+    end
+    if parent and not pcall(function() rec:appendToEntry(parent) end) then
+        return rollback({ success = false, error = "Failed to append to parent", error_code = "INTERNAL_ERROR" })
+    end
+
+    local okId, recId = pcall(function() return rec.ID end)
+    if not okId then recId = nil end
+
+    return { success = true, id = recId, record = unit18_rec_to_table(rec) }
+end
+
+function cmd_get_memory_record_by_index(params)
+    local index = params.index
+    if type(index) ~= "number" or index % 1 ~= 0 then
+        return { success = false, error = "index required (0-based integer)", error_code = "INVALID_PARAMS" }
+    end
+
+    local al, aerr = unit18_get_al()
+    if not al then return aerr end
+
+    local okC, count = pcall(function() return al.Count end)
+    if not okC then count = 0 end
+
+    if index < 0 or index >= count then
+        return { success = false,
+                 error = "index out of range (0.." .. tostring(count - 1) .. ")",
+                 error_code = "NOT_FOUND" }
+    end
+
+    local ok, rec = pcall(function() return al[index] end)
+    if not ok or not rec then
+        return { success = false, error = "Memory record not found", error_code = "NOT_FOUND" }
+    end
+
+    return { success = true, index = index, total = count, record = unit18_rec_to_table(rec) }
 end
 
 -- >>> END UNIT-19 <<<
@@ -5859,6 +6068,9 @@ local commandHandlers = {
     delete_memory_record     = cmd_delete_memory_record,
     get_memory_record_value  = cmd_get_memory_record_value,
     set_memory_record_value  = cmd_set_memory_record_value,
+    update_memory_record     = cmd_update_memory_record,
+    create_group             = cmd_create_group,
+    get_memory_record_by_index = cmd_get_memory_record_by_index,
     -- >>> END UNIT-18 <<<
     -- Input Automation (Unit-17) — system-wide, no process guard required
     get_pixel = cmd_get_pixel,

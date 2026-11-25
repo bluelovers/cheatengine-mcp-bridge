@@ -87,6 +87,7 @@ sys.stdout = sys.stderr
 
 # Now safe to import libraries that might print during import
 import json
+import re
 import socket
 import struct
 import time
@@ -1356,16 +1357,22 @@ def delete_structure(structure_id: int) -> str:
 # >>> BEGIN UNIT-18 Cheat Table Records <<<
 
 @mcp.tool()
-def load_table(filename: str, merge: bool = False) -> str:
+def load_table(filename: str, merge: bool = False, ignore_lua_script_dialog: bool = False) -> str:
     """Load a Cheat Engine table (.ct) file into the current session.
 
     Args:
         filename: Path to the .ct or .cetrainer file to load.
         merge: If True, merge with the current table instead of replacing it.
+        ignore_lua_script_dialog: If True, suppress CE's prompt about the table
+            containing a Lua script (otherwise the prompt blocks the pipe).
 
     Returns JSON with: success.
     """
-    return format_result(ce_client.send_command("load_table", {"filename": filename, "merge": merge}))
+    return format_result(ce_client.send_command("load_table", {
+        "filename": filename,
+        "merge": merge,
+        "ignore_lua_script_dialog": ignore_lua_script_dialog,
+    }))
 
 @mcp.tool()
 def save_table(filename: str, protect: bool = False) -> str:
@@ -1378,6 +1385,169 @@ def save_table(filename: str, protect: bool = False) -> str:
     Returns JSON with: success.
     """
     return format_result(ce_client.send_command("save_table", {"filename": filename, "protect": protect}))
+
+# ---------------------------------------------------------------------------
+# Table-level <LuaScript> node (the block sitting after </CheatEntries>).
+# CE exposes no Lua accessor for it, so it is operated on at the file level:
+# read/patch the XML text directly, then load_table to push it into CE.
+# ---------------------------------------------------------------------------
+
+# Matches <LuaScript/>, <LuaScript/> with whitespace, or a full open/close pair.
+_LUASCRIPT_BLOCK_RE = re.compile(r"<LuaScript\s*/>|<LuaScript>.*?</LuaScript>", re.S)
+
+
+def _xml_escape_script(script: str) -> str:
+    return script.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _xml_unescape_script(text: str) -> str:
+    # "&amp;" last so escaped entities are not unescaped twice.
+    return text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def _read_table_text(filename: str) -> str:
+    with open(filename, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def _write_table_text(filename: str, text: str) -> None:
+    # newline="" keeps whatever line endings the file already uses.
+    with open(filename, "w", encoding="utf-8", newline="") as fh:
+        fh.write(text)
+
+
+def _extract_lua_script(text: str):
+    """Return (present, script) for a .ct file's text."""
+    match = _LUASCRIPT_BLOCK_RE.search(text)
+    if not match:
+        return False, ""
+    block = match.group(0)
+    if block.rstrip().endswith("/>"):
+        return True, ""
+    inner = block[len("<LuaScript>"):block.rfind("</LuaScript>")]
+    return True, _xml_unescape_script(inner)
+
+
+def _patch_lua_script(text: str, script: str) -> str:
+    """Replace the existing <LuaScript> block, or insert one before </CheatTable>."""
+    replacement = "<LuaScript>" + _xml_escape_script(script) + "</LuaScript>"
+    # Lambda keeps backslashes in the script from being read as group refs.
+    patched, count = _LUASCRIPT_BLOCK_RE.subn(lambda _m: replacement, text, count=1)
+    if count == 0:
+        marker = "</CheatTable>"
+        idx = text.rfind(marker)
+        if idx == -1:
+            raise ValueError("not a Cheat Table: </CheatTable> not found")
+        patched = text[:idx] + replacement + "\n" + text[idx:]
+    return patched
+
+
+@mcp.tool()
+def get_table_lua_script(filename: str) -> str:
+    """Read the table-level <LuaScript> block of a .ct file on disk.
+
+    This is the script CE runs for the whole table (the block after
+    </CheatEntries>), not a record in the address list.
+
+    Args:
+        filename: Path to the .ct file.
+
+    Returns JSON with: success, present (bool), script (str; empty when the
+    file has no LuaScript block or an empty one).
+    """
+    try:
+        text = _read_table_text(filename)
+    except (OSError, ValueError) as exc:  # ValueError covers UnicodeDecodeError
+        return format_result({"success": False, "error": str(exc), "error_code": "NOT_FOUND"})
+    present, script = _extract_lua_script(text)
+    return format_result({"success": True, "filename": filename,
+                          "present": present, "script": script})
+
+
+@mcp.tool()
+def set_table_lua_script(filename: str, script: str) -> str:
+    """Replace (or create) the table-level <LuaScript> block of a .ct file on disk.
+
+    Only the LuaScript block is rewritten; the rest of the file stays byte-for-byte
+    identical. Load the file with load_table afterwards to apply it in CE.
+
+    Args:
+        filename: Path to the .ct file to patch.
+        script: Lua source to store; XML-escaped automatically.
+
+    Returns JSON with: success, present_before (bool), script_length (int).
+    """
+    if not filename:
+        return format_result({"success": False, "error": "filename required",
+                              "error_code": "INVALID_PARAMS"})
+    if not isinstance(script, str):
+        return format_result({"success": False, "error": "script must be a string",
+                              "error_code": "INVALID_PARAMS"})
+    try:
+        text = _read_table_text(filename)
+    except (OSError, ValueError) as exc:
+        return format_result({"success": False, "error": str(exc), "error_code": "NOT_FOUND"})
+    present, _old = _extract_lua_script(text)
+    try:
+        _write_table_text(filename, _patch_lua_script(text, script))
+    except (OSError, ValueError) as exc:
+        return format_result({"success": False, "error": str(exc),
+                              "error_code": "INVALID_PARAMS"})
+    return format_result({"success": True, "filename": filename,
+                          "present_before": present, "script_length": len(script)})
+
+
+@mcp.tool()
+def update_table_lua_script(script: str, merge: bool = False) -> str:
+    """Replace the <LuaScript> node of the table currently loaded in CE.
+
+    Round-trip: save the in-memory table to a temp .ct, patch only its LuaScript
+    block, then load it back. The caller's own .ct files are never touched.
+
+    Args:
+        script: Lua source to store; XML-escaped automatically.
+        merge: If True, merge into the current table instead of replacing it.
+
+    Returns JSON with: success, temp_file, script_length.
+    """
+    if not isinstance(script, str):
+        return format_result({"success": False, "error": "script must be a string",
+                              "error_code": "INVALID_PARAMS"})
+
+    import tempfile
+    tmp = os.path.join(tempfile.gettempdir(), f"ce_luascript_{os.getpid()}.ct")
+    try:
+        saved = ce_client.send_command("save_table", {"filename": tmp, "protect": False})
+        try:
+            saved_obj = saved if isinstance(saved, dict) else json.loads(saved)
+            if not saved_obj.get("success"):
+                return format_result({"success": False,
+                                      "error": "save_table failed: " + str(saved),
+                                      "error_code": "INTERNAL_ERROR"})
+        except (ValueError, AttributeError, TypeError):
+            return format_result({"success": False,
+                                  "error": "save_table returned: " + str(saved),
+                                  "error_code": "INTERNAL_ERROR"})
+
+        try:
+            text = _read_table_text(tmp)
+            _write_table_text(tmp, _patch_lua_script(text, script))
+        except (OSError, ValueError) as exc:
+            return format_result({"success": False, "error": str(exc),
+                                  "error_code": "INTERNAL_ERROR"})
+
+        loaded = ce_client.send_command("load_table", {
+            "filename": tmp,
+            "merge": merge,
+            "ignore_lua_script_dialog": True,
+        })
+        return format_result({"success": True, "temp_file": tmp,
+                              "script_length": len(script), "load_result": loaded})
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
 
 @mcp.tool()
 def get_address_list(offset: int = 0, limit: int = 100) -> str:
@@ -1425,6 +1595,80 @@ def create_memory_record(description: str, address: str, var_type: str = "dword"
         "address": address,
         "type": var_type,
     }))
+
+@mcp.tool()
+def update_memory_record(id: int, description: str = None, address: str = None,
+                         var_type: str = None, options: str = None, color: str = None,
+                         collapsed: bool = None, script: str = None) -> str:
+    """Update fields of an existing memory record in the cheat table.
+
+    Only the supplied fields are changed; omitted fields keep their current values.
+    This updates the table entry only — it never writes to the target process memory.
+
+    Args:
+        id: Unique numeric ID of the memory record to update.
+        description: New label for the entry.
+        address: New address expression (hex, symbol, or pointer expression).
+        var_type: New variable type — byte, word, dword, qword, float, double,
+            string, bytearray, aa (auto assemble script).
+        options: Record options, e.g. "moManualExpandCollapse" or
+            "[moManualExpandCollapse, moAllowManualCollapseAndExpand]".
+        color: Row color as an integer or hex string such as "80FF80".
+        collapsed: Collapse (true) or expand (false) the record.
+        script: Auto Assemble script body. Implies var_type="aa" when var_type
+            is omitted, because CE only honours Script on that type.
+
+    Returns JSON with: success, record ({id, description, address, type, value,
+    offsets, enabled, options, color, collapsed, is_group_header}).
+    """
+    params = {"id": id}
+    if description is not None:
+        params["description"] = description
+    if address is not None:
+        params["address"] = address
+    if var_type is not None:
+        params["type"] = var_type
+    if options is not None:
+        params["options"] = options
+    if color is not None:
+        params["color"] = color
+    if collapsed is not None:
+        params["collapsed"] = collapsed
+    if script is not None:
+        params["script"] = script
+    return format_result(ce_client.send_command("update_memory_record", params))
+
+@mcp.tool()
+def create_group(description: str, parent_id: int = None) -> str:
+    """Create a group header entry in the cheat table address list.
+
+    Args:
+        description: Label for the group header.
+        parent_id: ID of an existing record to nest this group under (optional;
+            omit for a top-level group).
+
+    Returns JSON with: success, id, record ({id, description, address, type,
+    value, offsets, enabled, options, color, collapsed, is_group_header}).
+    """
+    params = {"description": description}
+    if parent_id is not None:
+        params["parent_id"] = parent_id
+    return format_result(ce_client.send_command("create_group", params))
+
+@mcp.tool()
+def get_memory_record_by_index(index: int) -> str:
+    """Retrieve a memory record by its 0-based position in the address list.
+
+    Use get_address_list first when you need to map positions to records; the
+    list index and the record id are different values.
+
+    Args:
+        index: 0-based index into the address list.
+
+    Returns JSON with: success, index, total, record ({id, description, address,
+    type, value, offsets, enabled, options, color, collapsed, is_group_header}).
+    """
+    return format_result(ce_client.send_command("get_memory_record_by_index", {"index": index}))
 
 @mcp.tool()
 def delete_memory_record(id: int) -> str:

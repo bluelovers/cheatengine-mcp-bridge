@@ -2512,12 +2512,12 @@ rejected with `INVALID_PARAMS` rather than silently scanning for nothing.
 **Purpose:** Load a Cheat Engine table (.CT) file.
 
 **Parameters:**
-- `path` (str, required): Path to the .CT file.
+- `filename` (str, required): Path to the .CT file.
+- `merge` (bool, default=false): Merge into the current table instead of replacing it.
+- `ignore_lua_script_dialog` (bool, default=false): Suppress CE's "table contains a lua script" prompt, which otherwise blocks the pipe waiting for a click.
 
 **Returns:** JSON with:
 - `success` (bool)
-- `path` (str)
-- `entry_count` (int): Number of memory records loaded.
 
 ---
 
@@ -2526,11 +2526,61 @@ rejected with `INVALID_PARAMS` rather than silently scanning for nothing.
 **Purpose:** Save the current Cheat Engine table to a file.
 
 **Parameters:**
-- `path` (str, required): Output file path.
+- `filename` (str, required): Output file path.
+- `protect` (bool, default=false): Protect a `.cetrainer` file from normal reading.
 
 **Returns:** JSON with:
 - `success` (bool)
-- `path` (str)
+
+---
+
+### `get_table_lua_script`
+
+**Purpose:** Read the table-level `<LuaScript>` block of a .CT file on disk (the script CE runs for the whole table — the block after `</CheatEntries>`). File-only; no CE session needed.
+
+**Parameters:**
+- `filename` (str, required): Path to the .CT file.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `present` (bool): Whether the file has a `<LuaScript>` block.
+- `script` (str): Its contents (empty when absent or `<LuaScript/>`).
+
+**Error codes:** `NOT_FOUND`
+
+---
+
+### `set_table_lua_script`
+
+**Purpose:** Replace or create the `<LuaScript>` block of a .CT file on disk. Only that block is rewritten; the rest of the file stays byte-for-byte identical. Run `load_table` afterwards to apply it in CE.
+
+**Parameters:**
+- `filename` (str, required): Path to the .CT file to patch.
+- `script` (str, required): Lua source; XML-escaped automatically.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `present_before` (bool)
+- `script_length` (int)
+
+**Error codes:** `INVALID_PARAMS`, `NOT_FOUND`
+
+---
+
+### `update_table_lua_script`
+
+**Purpose:** Replace the `<LuaScript>` node of the table **currently loaded in CE**, without touching any of the caller's .CT files. Round-trip: `save_table` → temp file → patch the block → `load_table` (with `ignore_lua_script_dialog`) → delete temp file.
+
+**Parameters:**
+- `script` (str, required): Lua source; XML-escaped automatically.
+- `merge` (bool, default=false): Merge into the current table instead of replacing it.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `script_length` (int)
+- `load_result` (str): Raw `load_table` response.
+
+**Error codes:** `INVALID_PARAMS`, `INTERNAL_ERROR`
 
 ---
 
@@ -2543,7 +2593,7 @@ rejected with `INVALID_PARAMS` rather than silently scanning for nothing.
 **Returns:** JSON with:
 - `success` (bool)
 - `count` (int)
-- `records` (array): List of `{id, description, address, type, value, enabled}`.
+- `records` (array): List of `{id, description, address, type, value, enabled, options, color, collapsed, is_group_header}`.
 
 ---
 
@@ -2563,6 +2613,10 @@ rejected with `INVALID_PARAMS` rather than silently scanning for nothing.
 - `type` (str)
 - `value` (str)
 - `enabled` (bool)
+- `options` (str): e.g. `"[moManualExpandCollapse]"`
+- `color` (int): Row color, or nil when unset.
+- `collapsed` (bool)
+- `is_group_header` (bool)
 
 ---
 
@@ -2622,6 +2676,64 @@ rejected with `INVALID_PARAMS` rather than silently scanning for nothing.
 - `success` (bool)
 - `id` (int)
 - `value` (str)
+
+---
+
+### `update_memory_record`
+
+**Purpose:** Update fields of an existing memory record. Only the supplied fields change; this never writes to the target process memory.
+
+**Parameters:**
+- `id` (int, required): Record ID.
+- `description` (str, optional): New label.
+- `address` (str, optional): New address expression.
+- `type` (str, optional): New value type — `byte`, `word`, `dword`, `qword`, `float`, `double`, `string`, `bytearray`, `aa`.
+- `options` (str, optional): Record options, bare (`moManualExpandCollapse`) or bracketed (`[moManualExpandCollapse, moAllowManualCollapseAndExpand]`); normalised to bracketed form.
+- `color` (int or str, optional): Row color as an integer or hex string (`"80FF80"`, `"#80FF80"`).
+- `collapsed` (bool, optional): Collapse/expand the record.
+- `script` (str, optional): Auto Assemble script body. Implies `type = "aa"` when `type` is omitted, because CE only honours `Script` on that record type.
+
+All fields are validated before anything is written, so a bad parameter leaves the record untouched.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `record` (object): `{id, description, address, type, value, offsets, enabled, options, color, collapsed, is_group_header}` (+ `script` when it was supplied)
+
+**Error codes:** `INVALID_PARAMS`, `NOT_FOUND`, `INTERNAL_ERROR`
+
+---
+
+### `create_group`
+
+**Purpose:** Create a group header entry (used to nest records in the address list).
+
+**Parameters:**
+- `description` (str, required): Group label.
+- `parent_id` (int, optional): Existing record ID to nest under; omit for a top-level group.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `id` (int): New group header ID.
+- `record` (object): `{id, description, is_group_header=true, ...}`
+
+**Error codes:** `INVALID_PARAMS`, `NOT_FOUND`, `INTERNAL_ERROR`
+
+---
+
+### `get_memory_record_by_index`
+
+**Purpose:** Get a memory record by its 0-based position in the address list (the list index differs from the record ID).
+
+**Parameters:**
+- `index` (int, required): 0-based index.
+
+**Returns:** JSON with:
+- `success` (bool)
+- `index` (int)
+- `total` (int): Address list length.
+- `record` (object): `{id, description, address, type, value, offsets, enabled, options, color, collapsed, is_group_header}`
+
+**Error codes:** `INVALID_PARAMS`, `NOT_FOUND`
 
 ---
 
